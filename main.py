@@ -16,10 +16,10 @@ from aiogram.types import (
 
 # --- Настройки окружения Render ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Ваш Telegram ID для админки
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Ваш цифровой Telegram ID для админки
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан в переменных окружения!")
+    raise ValueError("BOT_TOKEN не задан в переменных окружения Render!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -38,7 +38,7 @@ def init_db():
                 joined_at TEXT
             )
         """)
-        # Товары и игры
+        # Каталог игр
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS games (
                 game_id TEXT PRIMARY KEY,
@@ -57,7 +57,7 @@ def init_db():
                 is_sold INTEGER DEFAULT 0
             )
         """)
-        # История покупок
+        # История заказов
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 order_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,14 +76,14 @@ def seed_data(conn):
     cursor.execute("SELECT COUNT(*) FROM games")
     if cursor.fetchone()[0] == 0:
         games = [
-            ("cp2077", "Cyberpunk 2077: Phantom Liberty", "RPG", 150, "Мрачный Найт-Сити и масштабное сюжетное DLC."),
+            ("cp2077", "Cyberpunk 2077: Phantom Liberty", "RPG", 150, "Мрачный Найт-Сити и масштабное дополнение."),
             ("er", "Elden Ring: Shadow of the Erdtree", "Action-RPG", 200, "Шедевр FromSoftware в Междуземье."),
-            ("bg3", "Baldur's Gate 3", "RPG", 180, "Лучшая ролевая игра года по правилам D&D."),
+            ("bg3", "Baldur's Gate 3", "RPG", 180, "Лучшая ролевая игра года по вселенной D&D."),
             ("gta5", "Grand Theft Auto V", "Action", 80, "Культовый экшен в Лос-Сантосе.")
         ]
         cursor.executemany("INSERT INTO games VALUES (?, ?, ?, ?, ?)", games)
 
-        # Стартовые ключи для тестов
+        # Тестовые ключи в наличии
         keys = [
             ("cp2077", "CP77-AAAA-1111"), ("cp2077", "CP77-BBBB-2222"),
             ("er", "ELDEN-XXXX-9999"),
@@ -140,7 +140,7 @@ def catalog_categories_kb() -> InlineKeyboardMarkup:
         categories = [row[0] for row in cursor.fetchall()]
 
     kb = [[InlineKeyboardButton(text=f"📁 {cat}", callback_data=f"cat_{cat}")] for cat in categories]
-    kb.append([InlineKeyboardButton(text="◀️ Назад", callback_data="to_main")])
+    kb.append([InlineKeyboardButton(text="◀️ В меню", callback_data="to_main")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def games_in_category_kb(category: str) -> InlineKeyboardMarkup:
@@ -165,7 +165,7 @@ def games_in_category_kb(category: str) -> InlineKeyboardMarkup:
 def game_detail_kb(game_id: str, in_stock: bool) -> InlineKeyboardMarkup:
     buttons = []
     if in_stock:
-        buttons.append([InlineKeyboardButton(text="⭐️ Купить за Telegram Stars", callback_data=f"buy_{game_id}")])
+        buttons.append([InlineKeyboardButton(text="⭐️ Оформить покупку", callback_data=f"buy_{game_id}")])
     buttons.append([InlineKeyboardButton(text="◀️ Назад в каталог", callback_data="catalog")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -182,7 +182,7 @@ async def cmd_start(message: Message):
     await message.answer(
         f"👋 Привет, **{message.from_user.first_name}**!\n\n"
         "Добро пожаловать в магазин цифровых игр **Steam & Epic**.\n"
-        "Оплата производится безопасно через официальные **Telegram Stars** с моментальной выдачей ключа.",
+        "Оплата производится безопасно через **Telegram Stars** с моментальной выдачей ключа.",
         reply_markup=main_menu_kb(),
         parse_mode="Markdown"
     )
@@ -208,7 +208,7 @@ async def cmd_admin(message: Message):
     )
     await message.answer(report, parse_mode="Markdown")
 
-# --- Хэндлеры меню и каталога ---
+# --- Навигация и меню ---
 @dp.callback_query(F.data == "to_main")
 async def nav_main(call: CallbackQuery):
     await call.message.edit_text("Главное меню магазина:", reply_markup=main_menu_kb())
@@ -265,7 +265,7 @@ async def nav_profile(call: CallbackQuery):
         "👤 **Ваш профиль**\n\n"
         f"• ID: `{call.from_user.id}`\n"
         f"• Куплено игр: `{len(orders)}`\n"
-        f"• Потрачено звезд: `⭐️ {total_spent}`"
+        f"• Потрачено звёзд: `⭐️ {total_spent}`"
     )
     back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="to_main")]])
     await call.message.edit_text(text, reply_markup=back_kb, parse_mode="Markdown")
@@ -291,7 +291,7 @@ async def nav_support(call: CallbackQuery):
     await call.message.edit_text("💬 Поддержка: @telegram_support", reply_markup=back_kb)
     await call.answer()
 
-# --- Оплата через Telegram Stars ---
+# --- Создание счёта (Инвойса) и Закрытие ---
 @dp.callback_query(F.data.startswith("buy_"))
 async def create_invoice(call: CallbackQuery):
     game_id = call.data.split("_")[1]
@@ -306,21 +306,35 @@ async def create_invoice(call: CallbackQuery):
 
     title, price = game
 
-    # Отправка инвойса на оплату Звёздами (валюта XTR)
+    # Инлайн-клавиатура прямо внутри инвойса: кнопка оплаты + кнопка закрытия
+    invoice_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"⭐️ Заплатить {price}", pay=True)],
+            [InlineKeyboardButton(text="❌ Отмена / Закрыть", callback_data="cancel_invoice")]
+        ]
+    )
+
     await bot.send_invoice(
         chat_id=call.message.chat.id,
         title=f"Ключ: {title}",
-        description=f"Моментальная доставка лицензионного ключа для платформы Steam.",
-        payload=f"{game_id}_{key_data[0]}",  # game_id_key_id
+        description="Моментальная доставка лицензионного ключа для платформы Steam.",
+        payload=f"{game_id}_{key_data[0]}",
         currency="XTR",
         prices=[LabeledPrice(label=title, amount=price)],
-        provider_token=""  # Для Telegram Stars оставляется пустым
+        provider_token="",  # Для Stars оставляем пустым
+        reply_markup=invoice_kb
     )
     await call.answer()
 
+# Обработчик кнопки «Отмена / Закрыть»
+@dp.callback_query(F.data == "cancel_invoice")
+async def cancel_invoice_handler(call: CallbackQuery):
+    await call.message.delete()
+    await call.answer("Счёт закрыт")
+
+# --- Обработка оплаты ---
 @dp.pre_checkout_query()
 async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    # Подтверждаем готовность провести платеж
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
 @dp.message(F.successful_payment)
@@ -344,9 +358,9 @@ async def process_successful_payment(message: Message):
     )
     await message.answer(success_text, parse_mode="Markdown")
 
-# --- Фоновый веб-сервер для Render Health Check ---
+# --- Фоновый веб-сервер для Render (Health Check) ---
 async def health_check(request):
-    return web.Response(text="Bot is active!")
+    return web.Response(text="Bot is running!")
 
 async def run_server():
     port = int(os.getenv("PORT", 8080))
