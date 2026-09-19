@@ -1,173 +1,354 @@
 import os
-import asyncio
+import sqlite3
 import logging
+from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    LabeledPrice,
+    PreCheckoutQuery
 )
 
-# Читаем токен из переменных окружения Render
+# --- Настройки окружения Render ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Ваш Telegram ID для админки
 
 if not BOT_TOKEN:
-    raise ValueError("Ошибка: переменная окружения BOT_TOKEN не задана!")
+    raise ValueError("BOT_TOKEN не задан в переменных окружения!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- База данных игр ---
-GAMES = {
-    "cp2077": {
-        "title": "Cyberpunk 2077: Phantom Liberty",
-        "price": 1990,
-        "description": "Экшен-RPG в открытом мире Найт-Сити с дополнением.",
-        "key": "CP77-XXXXX-YYYYY-ZZZZZ"
-    },
-    "er": {
-        "title": "Elden Ring: Shadow of the Erdtree",
-        "price": 2490,
-        "description": "Мрачное темное фэнтези от FromSoftware и Джорджа Мартина.",
-        "key": "ELDEN-AAAAA-BBBBB-CCCCC"
-    },
-    "bg3": {
-        "title": "Baldur's Gate 3",
-        "price": 2190,
-        "description": "Партийная ролевая игра нового поколения по вселенной D&D.",
-        "key": "BG3-11111-22222-33333"
-    },
-    "gta5": {
-        "title": "Grand Theft Auto V: Premium Edition",
-        "price": 990,
-        "description": "Легендарный криминальный экшен в открытом мире Лос-Сантоса.",
-        "key": "GTA5-99999-88888-77777"
-    }
-}
+# --- База данных (SQLite) ---
+DB_NAME = "gamestore.db"
+
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        # Пользователи
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                joined_at TEXT
+            )
+        """)
+        # Товары и игры
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS games (
+                game_id TEXT PRIMARY KEY,
+                title TEXT,
+                category TEXT,
+                price_stars INTEGER,
+                description TEXT
+            )
+        """)
+        # Пул одноразовых ключей
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS keys_pool (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id TEXT,
+                game_key TEXT UNIQUE,
+                is_sold INTEGER DEFAULT 0
+            )
+        """)
+        # История покупок
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                game_id TEXT,
+                game_key TEXT,
+                price_paid INTEGER,
+                created_at TEXT
+            )
+        """)
+        conn.commit()
+        seed_data(conn)
+
+def seed_data(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM games")
+    if cursor.fetchone()[0] == 0:
+        games = [
+            ("cp2077", "Cyberpunk 2077: Phantom Liberty", "RPG", 150, "Мрачный Найт-Сити и масштабное сюжетное DLC."),
+            ("er", "Elden Ring: Shadow of the Erdtree", "Action-RPG", 200, "Шедевр FromSoftware в Междуземье."),
+            ("bg3", "Baldur's Gate 3", "RPG", 180, "Лучшая ролевая игра года по правилам D&D."),
+            ("gta5", "Grand Theft Auto V", "Action", 80, "Культовый экшен в Лос-Сантосе.")
+        ]
+        cursor.executemany("INSERT INTO games VALUES (?, ?, ?, ?, ?)", games)
+
+        # Стартовые ключи для тестов
+        keys = [
+            ("cp2077", "CP77-AAAA-1111"), ("cp2077", "CP77-BBBB-2222"),
+            ("er", "ELDEN-XXXX-9999"),
+            ("bg3", "BG3-DOOR-8888"),
+            ("gta5", "GTA5-ROCK-7777")
+        ]
+        cursor.executemany("INSERT OR IGNORE INTO keys_pool (game_id, game_key) VALUES (?, ?)", keys)
+        conn.commit()
+
+init_db()
+
+# --- Вспомогательные функции БД ---
+def get_user_orders(user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT o.created_at, g.title, o.game_key, o.price_paid 
+            FROM orders o 
+            JOIN games g ON o.game_id = g.game_id 
+            WHERE o.user_id = ? 
+            ORDER BY o.order_id DESC
+        """, (user_id,))
+        return cursor.fetchall()
+
+def get_available_key(game_id: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, game_key FROM keys_pool WHERE game_id = ? AND is_sold = 0 LIMIT 1", (game_id,))
+        return cursor.fetchone()
+
+def complete_order(user_id: int, game_id: str, key_id: int, key_value: str, price: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE keys_pool SET is_sold = 1 WHERE id = ?", (key_id,))
+        cursor.execute(
+            "INSERT INTO orders (user_id, game_id, game_key, price_paid, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, game_id, key_value, price, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
+        conn.commit()
 
 # --- Клавиатуры ---
-def get_main_menu_kb() -> InlineKeyboardMarkup:
-    kb = [
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎮 Каталог игр", callback_data="catalog")],
-        [InlineKeyboardButton(text="ℹ️ О нас", callback_data="about"),
-         InlineKeyboardButton(text="💬 Поддержка", callback_data="support")]
-    ]
+        [InlineKeyboardButton(text="📦 Мои покупки", callback_data="my_orders"),
+         InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="💬 Поддержка", callback_data="support")]
+    ])
+
+def catalog_categories_kb() -> InlineKeyboardMarkup:
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT category FROM games")
+        categories = [row[0] for row in cursor.fetchall()]
+
+    kb = [[InlineKeyboardButton(text=f"📁 {cat}", callback_data=f"cat_{cat}")] for cat in categories]
+    kb.append([InlineKeyboardButton(text="◀️ Назад", callback_data="to_main")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def get_catalog_kb() -> InlineKeyboardMarkup:
+def games_in_category_kb(category: str) -> InlineKeyboardMarkup:
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT g.game_id, g.title, g.price_stars, COUNT(k.id) 
+            FROM games g 
+            LEFT JOIN keys_pool k ON g.game_id = k.game_id AND k.is_sold = 0 
+            WHERE g.category = ? 
+            GROUP BY g.game_id
+        """, (category,))
+        items = cursor.fetchall()
+
+    kb = []
+    for g_id, title, price, count in items:
+        status = f"⭐️ {price}" if count > 0 else "❌ Закончился"
+        kb.append([InlineKeyboardButton(text=f"{title} ({status})", callback_data=f"game_{g_id}")])
+    kb.append([InlineKeyboardButton(text="◀️ К категориям", callback_data="catalog")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def game_detail_kb(game_id: str, in_stock: bool) -> InlineKeyboardMarkup:
     buttons = []
-    for game_id, data in GAMES.items():
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{data['title']} — {data['price']} ₽",
-                callback_data=f"game_{game_id}"
-            )
-        ])
-    buttons.append([InlineKeyboardButton(text="◀️ В главное меню", callback_data="to_main")])
+    if in_stock:
+        buttons.append([InlineKeyboardButton(text="⭐️ Купить за Telegram Stars", callback_data=f"buy_{game_id}")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад в каталог", callback_data="catalog")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_game_card_kb(game_id: str) -> InlineKeyboardMarkup:
-    kb = [
-        [InlineKeyboardButton(text="💳 Купить", callback_data=f"buy_{game_id}")],
-        [InlineKeyboardButton(text="◀️ Назад в каталог", callback_data="catalog")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-# --- Обработчики aiogram ---
+# --- Хэндлеры команд ---
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    text = (
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        "Добро пожаловать в магазин цифровых ключей игр.\n"
-        "Выбирай игру в каталоге и забирай ключ сразу после покупки!"
-    )
-    await message.answer(text, reply_markup=get_main_menu_kb())
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.cursor().execute(
+            "INSERT OR IGNORE INTO users VALUES (?, ?, ?)",
+            (message.from_user.id, message.from_user.username or "", datetime.now().strftime("%Y-%m-%d"))
+        )
+        conn.commit()
 
+    await message.answer(
+        f"👋 Привет, **{message.from_user.first_name}**!\n\n"
+        "Добро пожаловать в магазин цифровых игр **Steam & Epic**.\n"
+        "Оплата производится безопасно через официальные **Telegram Stars** с моментальной выдачей ключа.",
+        reply_markup=main_menu_kb(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        users_count = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        orders_count = c.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        revenue = c.execute("SELECT COALESCE(SUM(price_paid), 0) FROM orders").fetchone()[0]
+        keys_left = c.execute("SELECT COUNT(*) FROM keys_pool WHERE is_sold = 0").fetchone()[0]
+
+    report = (
+        "📊 **Панель Администратора**\n\n"
+        f"• Пользователей: `{users_count}`\n"
+        f"• Всего продаж: `{orders_count}`\n"
+        f"• Выручка: `⭐️ {revenue}`\n"
+        f"• Ключей в наличии: `{keys_left} шт.`"
+    )
+    await message.answer(report, parse_mode="Markdown")
+
+# --- Хэндлеры меню и каталога ---
 @dp.callback_query(F.data == "to_main")
-async def back_to_main(call: CallbackQuery):
-    await call.message.edit_text("Главное меню магазина:", reply_markup=get_main_menu_kb())
+async def nav_main(call: CallbackQuery):
+    await call.message.edit_text("Главное меню магазина:", reply_markup=main_menu_kb())
     await call.answer()
 
 @dp.callback_query(F.data == "catalog")
-async def show_catalog(call: CallbackQuery):
-    await call.message.edit_text(
-        "🔥 **Каталог доступных игр:**\nВыберите нужную позицию:",
-        reply_markup=get_catalog_kb(),
-        parse_mode="Markdown"
-    )
+async def nav_catalog(call: CallbackQuery):
+    await call.message.edit_text("📂 **Выберите категорию:**", reply_markup=catalog_categories_kb(), parse_mode="Markdown")
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("cat_"))
+async def nav_category_games(call: CallbackQuery):
+    category = call.data.split("_")[1]
+    await call.message.edit_text(f"🎮 **Игры в категории «{category}»:**", reply_markup=games_in_category_kb(category), parse_mode="Markdown")
     await call.answer()
 
 @dp.callback_query(F.data.startswith("game_"))
-async def show_game(call: CallbackQuery):
+async def nav_game_detail(call: CallbackQuery):
     game_id = call.data.split("_")[1]
-    game = GAMES.get(game_id)
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT g.title, g.description, g.price_stars, COUNT(k.id) 
+            FROM games g 
+            LEFT JOIN keys_pool k ON g.game_id = k.game_id AND k.is_sold = 0 
+            WHERE g.game_id = ? GROUP BY g.game_id
+        """, (game_id,))
+        game = c.fetchone()
 
     if not game:
-        await call.answer("Игра не найдена!", show_alert=True)
+        await call.answer("Игра не найдена", show_alert=True)
         return
 
-    card_text = (
-        f"🎮 *{game['title']}*\n\n"
-        f"📝 {game['description']}\n\n"
-        f"💰 **Цена:** `{game['price']} ₽`\n"
-        f"⚡️ Доставка: моментально"
+    title, desc, price, count = game
+    stock_label = f"✅ В наличии ({count} шт.)" if count > 0 else "❌ Нет в наличии"
+
+    text = (
+        f"🎮 **{title}**\n\n"
+        f"📖 {desc}\n\n"
+        f"💰 **Цена:** `⭐️ {price} Stars`\n"
+        f"📦 **Наличие:** {stock_label}\n"
+        f"⚡️ Доставка: моментально после подтверждения"
     )
-    await call.message.edit_text(card_text, reply_markup=get_game_card_kb(game_id), parse_mode="Markdown")
+    await call.message.edit_text(text, reply_markup=game_detail_kb(game_id, count > 0), parse_mode="Markdown")
     await call.answer()
 
-@dp.callback_query(F.data.startswith("buy_"))
-async def process_purchase(call: CallbackQuery):
-    game_id = call.data.split("_")[1]
-    game = GAMES.get(game_id)
+# --- Профиль и Мои покупки ---
+@dp.callback_query(F.data == "profile")
+async def nav_profile(call: CallbackQuery):
+    orders = get_user_orders(call.from_user.id)
+    total_spent = sum(item[3] for item in orders)
 
-    if not game:
-        await call.answer("Ошибка при оформлении.", show_alert=True)
-        return
-
-    success_text = (
-        f"🎉 **Оплата успешно завершена!**\n\n"
-        f"Игра: *{game['title']}*\n"
-        f"Ключ активации (Steam):\n"
-        f"🔑 `{game['key']}`\n\n"
-        f"_Скопируйте ключ и активируйте в аккаунте._"
-    )
-    back_kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🎮 Вернуться в каталог", callback_data="catalog")]]
-    )
-    await call.message.edit_text(success_text, reply_markup=back_kb, parse_mode="Markdown")
-    await call.answer("Товар выдан!")
-
-@dp.callback_query(F.data == "about")
-async def about_info(call: CallbackQuery):
     text = (
-        "🛡 **О магазине GameStore**\n\n"
-        "• Моментальная выдача ключей\n"
-        "• 100% гарантия валидности\n"
-        "• Техподдержка 24/7"
+        "👤 **Ваш профиль**\n\n"
+        f"• ID: `{call.from_user.id}`\n"
+        f"• Куплено игр: `{len(orders)}`\n"
+        f"• Потрачено звезд: `⭐️ {total_spent}`"
     )
-    back_kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="to_main")]]
-    )
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="to_main")]])
+    await call.message.edit_text(text, reply_markup=back_kb, parse_mode="Markdown")
+    await call.answer()
+
+@dp.callback_query(F.data == "my_orders")
+async def nav_my_orders(call: CallbackQuery):
+    orders = get_user_orders(call.from_user.id)
+    if not orders:
+        text = "📦 У вас пока нет купленных игр."
+    else:
+        text = "📦 **Ваша библиотека ключей:**\n\n"
+        for date, title, key, price in orders:
+            text += f"🎮 **{title}**\n🔑 Ключ: `{key}`\n📅 {date} (⭐️ {price})\n────────────\n"
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="to_main")]])
     await call.message.edit_text(text, reply_markup=back_kb, parse_mode="Markdown")
     await call.answer()
 
 @dp.callback_query(F.data == "support")
-async def support_info(call: CallbackQuery):
-    text = "💬 Если возникли вопросы или проблемы, напишите: @support_username"
-    back_kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="to_main")]]
-    )
-    await call.message.edit_text(text, reply_markup=back_kb)
+async def nav_support(call: CallbackQuery):
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="to_main")]])
+    await call.message.edit_text("💬 Поддержка: @telegram_support", reply_markup=back_kb)
     await call.answer()
 
-# --- Веб-сервер для Render (Health Check) ---
-async def health_check(request):
-    return web.Response(text="Bot is running!")
+# --- Оплата через Telegram Stars ---
+@dp.callback_query(F.data.startswith("buy_"))
+async def create_invoice(call: CallbackQuery):
+    game_id = call.data.split("_")[1]
+    key_data = get_available_key(game_id)
 
-async def run_dummy_server():
+    if not key_data:
+        await call.answer("К сожалению, ключи этой игры только что закончились!", show_alert=True)
+        return
+
+    with sqlite3.connect(DB_NAME) as conn:
+        game = conn.cursor().execute("SELECT title, price_stars FROM games WHERE game_id = ?", (game_id,)).fetchone()
+
+    title, price = game
+
+    # Отправка инвойса на оплату Звёздами (валюта XTR)
+    await bot.send_invoice(
+        chat_id=call.message.chat.id,
+        title=f"Ключ: {title}",
+        description=f"Моментальная доставка лицензионного ключа для платформы Steam.",
+        payload=f"{game_id}_{key_data[0]}",  # game_id_key_id
+        currency="XTR",
+        prices=[LabeledPrice(label=title, amount=price)],
+        provider_token=""  # Для Telegram Stars оставляется пустым
+    )
+    await call.answer()
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    # Подтверждаем готовность провести платеж
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    payload = message.successful_payment.invoice_payload
+    game_id, key_id = payload.split("_")
+    price = message.successful_payment.total_amount
+
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        key_val = cursor.execute("SELECT game_key FROM keys_pool WHERE id = ?", (int(key_id),)).fetchone()[0]
+        game_title = cursor.execute("SELECT title FROM games WHERE game_id = ?", (game_id,)).fetchone()[0]
+
+    complete_order(message.from_user.id, game_id, int(key_id), key_val, price)
+
+    success_text = (
+        f"🎉 **Оплата принята! Спасибо за покупку!**\n\n"
+        f"🎮 Игра: **{game_title}**\n"
+        f"🔑 Ваш лицензионный ключ:\n`{key_val}`\n\n"
+        f"_Ключ навсегда сохранен в разделе «📦 Мои покупки»._"
+    )
+    await message.answer(success_text, parse_mode="Markdown")
+
+# --- Фоновый веб-сервер для Render Health Check ---
+async def health_check(request):
+    return web.Response(text="Bot is active!")
+
+async def run_server():
     port = int(os.getenv("PORT", 8080))
     app = web.Application()
     app.router.add_get("/", health_check)
@@ -176,17 +357,13 @@ async def run_dummy_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# --- Запуск приложения ---
+# --- Точка входа ---
 async def main():
     logging.basicConfig(level=logging.INFO)
-    print("Бот запускается...")
-
-    # Запуск фонового веб-сервера для Render
-    await run_dummy_server()
-
-    # Сброс зависших апдейтов и запуск Polling
+    await run_server()
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
