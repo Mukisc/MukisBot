@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
@@ -7,8 +8,8 @@ from aiogram.types import Message
 # Включаем логирование, чтобы видеть события и ошибки в консоли
 logging.basicConfig(level=logging.INFO)
 
-# Замените 'YOUR_BOT_TOKEN' на токен, полученный от @BotFather
-BOT_TOKEN = "8946562478:AAErgPPJBfldwhrFh4--BZpBCfll9T5jjbE"
+# Получаем токен из переменных окружения Render
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
